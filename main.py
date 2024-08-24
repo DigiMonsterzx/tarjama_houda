@@ -1,9 +1,16 @@
 import os
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackQueryHandler, ContextTypes
-from googletrans import Translator
 import cloudinary.uploader
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from supabase import create_client, Client
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
+from googletrans import Translator
+from telegram.constants import ParseMode
+import uvicorn
+
+# Initialize FastAPI
+app = FastAPI()
 
 # Set up environment variables for Cloudinary and Supabase
 cloudinary.config(
@@ -19,12 +26,14 @@ supabase: Client = create_client(supabase_url, supabase_key)
 # Initialize the translator
 translator = Translator()
 
-# Step 3: Define Bot Functions
-def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    update.message.reply_text("Welcome! Please upload a Word file to start the translation process.")
+# Initialize the bot application
+app_bot = ApplicationBuilder().token(os.getenv('TELEGRAM_TOKEN')).build()
 
-def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Ask user to choose the original language
+# Define Bot Functions
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Welcome! Please upload a Word file to start the translation process.")
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton("English (EN)", callback_data='en')],
         [InlineKeyboardButton("French (FR)", callback_data='fr')],
@@ -33,14 +42,13 @@ def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     context.user_data['file_id'] = update.message.document.file_id
-    update.message.reply_text('Please choose the original language:', reply_markup=reply_markup)
+    await update.message.reply_text('Please choose the original language:', reply_markup=reply_markup)
 
-def handle_language_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_language_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     context.user_data['original_language'] = query.data
-    query.answer()
+    await query.answer()
 
-    # Ask user to choose the target language
     keyboard = [
         [InlineKeyboardButton("English (EN)", callback_data='en')],
         [InlineKeyboardButton("French (FR)", callback_data='fr')],
@@ -48,17 +56,17 @@ def handle_language_selection(update: Update, context: ContextTypes.DEFAULT_TYPE
         [InlineKeyboardButton("Arabic (AR)", callback_data='ar')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    query.edit_message_text(text="Please choose the target language:", reply_markup=reply_markup)
+    await query.edit_message_text(text="Please choose the target language:", reply_markup=reply_markup)
 
-def handle_translation_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_translation_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     context.user_data['convert_to'] = query.data
-    query.answer()
+    await query.answer()
 
     # Download the file from Telegram
     file_id = context.user_data['file_id']
-    file = context.bot.get_file(file_id)
-    file_path = file.download()
+    file = await context.bot.get_file(file_id)
+    file_path = await file.download()
 
     # Upload the file to Cloudinary
     response = cloudinary.uploader.upload(file_path, resource_type="auto")
@@ -73,20 +81,30 @@ def handle_translation_selection(update: Update, context: ContextTypes.DEFAULT_T
         'status': 'Queued'
     }).execute()
 
-    query.edit_message_text(text=f"Your file has been uploaded and queued for translation. File URL: {file_url}")
+    await query.edit_message_text(
+        text=f"Your file has been uploaded and queued for translation.\n\n[File URL]({file_url})",
+        parse_mode=ParseMode.MARKDOWN
+    )
 
-# Step 4: Main Function to Run the Bot
-def main():
-    updater = Updater(os.getenv('TELEGRAM_TOKEN'), use_context=True)
-    dp = updater.dispatcher
+# Register Bot Commands and Handlers
+app_bot.add_handler(CommandHandler("start", start))
+app_bot.add_handler(MessageHandler(filters.Document.MIMEType("application/vnd.openxmlformats-officedocument.wordprocessingml.document"), handle_document))
+app_bot.add_handler(CallbackQueryHandler(handle_language_selection, pattern='^(en|fr|es|ar)$'))
+app_bot.add_handler(CallbackQueryHandler(handle_translation_selection, pattern='^(en|fr|es|ar)$'))
 
-    dp.add_handler(CommandHandler("start", start))
-    dp.add_handler(MessageHandler(Filters.document.mime_type("application/vnd.openxmlformats-officedocument.wordprocessingml.document"), handle_document))
-    dp.add_handler(CallbackQueryHandler(handle_language_selection, pattern='^(en|fr|es|ar)$'))
-    dp.add_handler(CallbackQueryHandler(handle_translation_selection, pattern='^(en|fr|es|ar)$'))
+# Define FastAPI route for Telegram Webhook
+@app.post("/webhook")
+async def process_webhook(request: Request):
+    json_data = await request.json()
+    update = Update.de_json(json_data, app_bot.bot)
+    await app_bot.process_update(update)
+    return JSONResponse(content={"status": "ok"})
 
-    updater.start_polling()
-    updater.idle()
+# Define the FastAPI root route
+@app.get("/")
+def read_root():
+    return {"message": "Telegram bot is running"}
 
-if __name__ == '__main__':
-    main()
+# Run FastAPI application using Uvicorn
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
